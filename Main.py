@@ -723,9 +723,10 @@ def main():
     app = Application.builder().token(TOKEN).build()
     for name, fn in HANDLERS.items():
         app.add_handler(CommandHandler(name, fn))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, t_meteo))
+        app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, t_meteo))
     cmds = []
-    for _, items in GROUPS:
+    for _, items in GROUPS: 
         for name, usage, desc in items:
             cmds.append(BotCommand(name, desc))
     async def set_cmds(app_):
