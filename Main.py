@@ -661,7 +661,7 @@ async def c_giorni(update, ctx):
     else: target = date(int(parts[2]), int(parts[1]), int(parts[0]))
     if target < today: target = date(target.year + 1, target.month, target.day)
     await say(update, f"📅 Mancano {(target - today).days} giorni a {fdate(target)}")
-  @cmd("password")
+@cmd("password")
 async def c_password(update, ctx):
     n = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 16
     n = max(6, min(64, n))
