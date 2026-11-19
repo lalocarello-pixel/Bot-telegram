@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Bot Telegram personale (meteo di Piacenza + comandi quotidiani).
-Requisiti: pip install "python-telegram-bot[job-queue]>=21" httpx
 Variabili: BOT_TOKEN, ALLOWED_USER_ID
 Avvio: python Main.py
 """
@@ -471,4 +470,270 @@ async def c_contatto(update, ctx):
         if not r: raise LookupError(f"Contatto «{parts[0]}» non trovato")
         return await say(update, f"👤 {r[0]['name']}: {r[0]['info']}")
     db("INSERT INTO contacts(name, info) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET info=excluded.info", parts[0], parts[1])
-    await sa
+    await say(update, f"👤 Contatto {parts[0]} salvato")
+
+@cmd("cerca")
+async def c_cerca(update, ctx):
+    q = arg_text(update)
+    if not q: raise ValueError("Uso: /cerca testo")
+    out = []
+    for n in rows("SELECT * FROM notes WHERE text LIKE ? ORDER BY id DESC LIMIT 5", f"%{q}%"):
+        out.append(f"📝 Nota #{n['id']}: {n['text'][:80]}")
+    for t in rows("SELECT * FROM todos WHERE text LIKE ? ORDER BY id DESC LIMIT 5", f"%{q}%"):
+        out.append(f"✅ Todo #{t['id']}: {t['text'][:80]}")
+    for c in rows("SELECT * FROM contacts WHERE name LIKE ? OR info LIKE ? LIMIT 5", f"%{q}%", f"%{q}%"):
+        out.append(f"👤 {c['name']}: {c['info'][:80]}")
+    for s in rows("SELECT * FROM spesa WHERE item LIKE ? LIMIT 5", f"%{q}%"):
+        out.append(f"🛒 Spesa #{s['id']}: {s['item']}")
+    await say(update, "🔍 Risultati\n" + "\n".join(out) if out else "Niente trovato.")
+
+def parse_delay(s):
+    s = s.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*([smhd])", s)
+    if not m: raise ValueError("Uso: 30s, 10m, 2h, 1d  es: /ricorda 30m pasta")
+    n, u = int(m.group(1)), m.group(2)
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[u]
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    try:
+        await context.bot.send_message(chat_id=job.chat_id, text=f"⏰ PROMEMORIA: {job.data}")
+        db("DELETE FROM reminders WHERE chat_id=? AND text=?", job.chat_id, job.data)
+    except Exception:
+        log.exception("Reminder failed")
+
+@cmd("ricorda")
+async def c_ricorda(update, ctx):
+    if len(ctx.args) < 2: raise ValueError("Uso: /ricorda 30m testo")
+    secs = parse_delay(ctx.args[0])
+    text = " ".join(ctx.args[1:])
+    ts = int(time.time()) + secs
+    cur = db("INSERT INTO reminders(chat_id, ts, text) VALUES (?,?,?)", update.effective_chat.id, ts, text)
+    ctx.job_queue.run_once(send_reminder, secs, chat_id=update.effective_chat.id, data=text, name=f"rem_{cur.lastrowid}")
+    await say(update, f"⏰ Ok, ti avviso tra {ctx.args[0]}: {text} (id #{cur.lastrowid})")
+
+@cmd("timer")
+async def c_timer(update, ctx):
+    if not ctx.args: raise ValueError("Uso: /timer 10m [nome]")
+    secs = parse_delay(ctx.args[0])
+    name = " ".join(ctx.args[1:]) or "Timer"
+    ctx.job_queue.run_once(send_reminder, secs, chat_id=update.effective_chat.id, data=f"{name} scaduto!", name=f"timer_{int(time.time())}")
+    await say(update, f"⏱️ Timer {name} partito, ti avviso tra {ctx.args[0]}")
+
+@cmd("pomodoro")
+async def c_pomodoro(update, ctx):
+    mins = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 25
+    pausa = int(ctx.args[1]) if len(ctx.args) > 1 and ctx.args[1].isdigit() else 5
+    ctx.job_queue.run_once(send_reminder, mins * 60, chat_id=update.effective_chat.id, data=f"Pomodoro finito! Pausa di {pausa} min.", name=f"pom_{int(time.time())}")
+    await say(update, f"🍅 Pomodoro partito: {mins} min di lavoro, poi {pausa} min di pausa.")
+
+@cmd("promemoria")
+async def c_promemoria(update, ctx):
+    r = rows("SELECT * FROM reminders WHERE chat_id=? ORDER BY ts", update.effective_chat.id)
+    if not r: return await say(update, "Nessun promemoria attivo.")
+    lines = []
+    for x in r:
+        left = max(0, x["ts"] - int(time.time()))
+        lines.append(f"#{x['id']} tra {left//60}m {left%60}s — {x['text']}")
+    await say(update, "⏰ Promemoria attivi\n" + "\n".join(lines))
+
+@cmd("annulla")
+async def c_annulla(update, ctx):
+    i = need_id(ctx, "/annulla id")
+    n = db("DELETE FROM reminders WHERE id=?", i).rowcount
+    for job in ctx.job_queue.jobs():
+        if job.name == f"rem_{i}":
+            job.schedule_removal()
+    await say(update, "🗑️ Promemoria annullato" if n else "Promemoria non trovato")
+
+@cmd("soldi")
+async def c_soldi(update, ctx):
+    if len(ctx.args) < 2: raise ValueError("Uso: /soldi 12,50 pranzo")
+    amount = num(ctx.args[0])
+    descr = " ".join(ctx.args[1:])
+    cur = db("INSERT INTO expenses(ts, amount, descr) VALUES (?,?,?)", int(time.time()), amount, descr)
+    await say(update, f"💶 Registrato #{cur.lastrowid}: {eur(amount)} — {descr}")
+
+@cmd("speso")
+async def c_speso(update, ctx):
+    today = now()
+    if ctx.args:
+        parts = ctx.args[0].split("/")
+        mm = int(parts[0]); yy = int(parts[1]) if len(parts) > 1 else today.year
+    else:
+        mm, yy = today.month, today.year
+    start = datetime(yy, mm, 1, tzinfo=TZ).timestamp()
+    if mm == 12: end = datetime(yy + 1, 1, 1, tzinfo=TZ).timestamp()
+    else: end = datetime(yy, mm + 1, 1, tzinfo=TZ).timestamp()
+    r = rows("SELECT * FROM expenses WHERE ts>=? AND ts<? ORDER BY ts", int(start), int(end))
+    tot = sum(x["amount"] for x in r)
+    lines = [f"💶 Speso {mm:02d}/{yy}: {eur(tot)} ({len(r)} spese)"]
+    for x in r:
+        lines.append(f"#{x['id']} {datetime.fromtimestamp(x['ts'], TZ):%d/%m} {eur(x['amount'])} — {x['descr']}")
+    await say(update, "\n".join(lines) if r else f"Nessuna spesa in {mm:02d}/{yy}")
+
+@cmd("delsoldi")
+async def c_delsoldi(update, ctx):
+    i = need_id(ctx, "/delsoldi id")
+    n = db("DELETE FROM expenses WHERE id=?", i).rowcount
+    await say(update, "🗑️ Spesa eliminata" if n else "Spesa non trovata")
+
+@cmd("iva")
+async def c_iva(update, ctx):
+    if not ctx.args: raise ValueError("Uso: /iva 100 [22]")
+    base = num(ctx.args[0]); aliq = num(ctx.args[1]) if len(ctx.args) > 1 else 22
+    iva = base * aliq / 100
+    await say(update, f"🧾 Base: {eur(base)}\nIVA {fmt(aliq, 0)}%: {eur(iva)}\nTotale: {eur(base + iva)}")
+
+@cmd("sconto")
+async def c_sconto(update, ctx):
+    if len(ctx.args) < 2: raise ValueError("Uso: /sconto 100 20")
+    prezzo = num(ctx.args[0]); perc = num(ctx.args[1].replace("%", ""))
+    ris = prezzo * perc / 100
+    await say(update, f"🏷️ Prezzo: {eur(prezzo)}\nSconto {fmt(perc, 0)}%: -{eur(ris)}\nPaghi: {eur(prezzo - ris)}")
+
+@cmd("dividi")
+async def c_dividi(update, ctx):
+    if len(ctx.args) < 2: raise ValueError("Uso: /dividi 60 3 [10%]")
+    totale = num(ctx.args[0]); persone = int(num(ctx.args[1]))
+    mancia = num(ctx.args[2].replace("%", "")) if len(ctx.args) > 2 else 0
+    tot2 = totale * (1 + mancia / 100)
+    await say(update, f"🧾 Totale con mancia {fmt(mancia, 0)}%: {eur(tot2)}\nA testa ({persone} persone): {eur(tot2 / persone)}")
+
+@cmd("valuta")
+async def c_valuta(update, ctx):
+    if len(ctx.args) < 2: raise ValueError("Uso: /valuta 100 usd [eur]")
+    amount = num(ctx.args[0]); frm = ctx.args[1].upper(); to = ctx.args[2].upper() if len(ctx.args) > 2 else "EUR"
+    data = await http_get(f"https://open.er-api.com/v6/latest/{frm}")
+    rate = data.get("rates", {}).get(to)
+    if not rate: raise LookupError(f"Valuta {frm}->{to} non trovata")
+    await say(update, f"💱 {fmt(amount)} {frm} = {fmt(amount * rate)} {to}")
+
+ALLOWED_OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv, ast.Mod: operator.mod, ast.Pow: operator.pow, ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+def eval_expr(node):
+    if isinstance(node, ast.Expression): return eval_expr(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)): return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_OPS:
+        return ALLOWED_OPS[type(node.op)](eval_expr(node.left), eval_expr(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_OPS:
+        return ALLOWED_OPS[type(node.op)](eval_expr(node.operand))
+    raise ValueError("Espressione non consentita")
+
+@cmd("calc")
+async def c_calc(update, ctx):
+    expr = arg_text(update)
+    if not expr: raise ValueError("Uso: /calc 2+3*4")
+    res = eval_expr(ast.parse(expr.replace(",", "."), mode="eval"))
+    await say(update, f"🧮 {expr} = {fmt(res) if isinstance(res, float) else res}")
+
+UNITS = {"km": 1000, "m": 1, "cm": 0.01, "mm": 0.001, "mi": 1609.34, "kg": 1000, "g": 1, "lb": 453.592, "l": 1, "ml": 0.001, "c": 1, "f": 1}
+@cmd("converti")
+async def c_converti(update, ctx):
+    if len(ctx.args) < 3: raise ValueError("Uso: /converti 10 km mi")
+    v = num(ctx.args[0]); a = ctx.args[1].lower(); b = ctx.args[2].lower()
+    if a in ("c", "f") or b in ("c", "f"):
+        if a == "c" and b == "f": res = v * 9 / 5 + 32
+        elif a == "f" and b == "c": res = (v - 32) * 5 / 9
+        else: raise ValueError("Conversione temperatura: solo C <-> F")
+        return await say(update, f"🌡️ {fmt(v)}°{a.upper()} = {fmt(res)}°{b.upper()}")
+    if a not in UNITS or b not in UNITS: raise ValueError("Unità non supportate")
+    res = v * UNITS[a] / UNITS[b]
+    await say(update, f"🔄 {fmt(v)} {a} = {fmt(res)} {b}")
+
+@cmd("eta")
+async def c_eta(update, ctx):
+    if not ctx.args: raise ValueError("Uso: /eta 15/05/1990")
+    try: birth = datetime.strptime(ctx.args[0], "%d/%m/%Y").date()
+    except ValueError: raise ValueError("Usa GG/MM/AAAA es: /eta 15/05/1990")
+    today = now().date()
+    age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+    nxt = date(today.year, birth.month, birth.day)
+    if nxt < today: nxt = date(today.year + 1, birth.month, birth.day)
+    await say(update, f"🎂 Hai {age} anni\nProssimo compleanno: {fdate(nxt)} (tra {(nxt - today).days} giorni)")
+
+@cmd("giorni")
+async def c_giorni(update, ctx):
+    if not ctx.args: raise ValueError("Uso: /giorni 25/12 oppure /giorni 25/12/2026")
+    parts = ctx.args[0].split("/")
+    today = now().date()
+    if len(parts) == 2: target = date(today.year, int(parts[1]), int(parts[0]))
+    else: target = date(int(parts[2]), int(parts[1]), int(parts[0]))
+    if target < today: target = date(target.year + 1, target.month, target.day)
+    await say(update, f"📅 Mancano {(target - today).days} giorni a {fdate(target)}")
+  @cmd("password")
+async def c_password(update, ctx):
+    n = int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 16
+    n = max(6, min(64, n))
+    chars = string.ascii_letters + string.digits + "!@#$%*"
+    pw = "".join(secrets.choice(chars) for _ in range(n))
+    await say(update, f"🔐 Password ({n} caratteri):\n`{pw}`")
+
+@cmd("dado")
+async def c_dado(update, ctx):
+    arg = " ".join(ctx.args) or "6"
+    if "d" in arg.lower():
+        m = re.fullmatch(r"(\d+)d(\d+)", arg.lower().strip())
+        if not m: raise ValueError("Uso: /dado 2d6 oppure /dado 20")
+        n, f = int(m.group(1)), int(m.group(2))
+        rolls = [random.randint(1, f) for _ in range(min(n, 20))]
+        return await say(update, f"🎲 {rolls} = totale {sum(rolls)}")
+    f = int(arg) if arg.isdigit() else 6
+    await say(update, f"🎲 Hai tirato: {random.randint(1, f)} (d{f})")
+
+@cmd("scegli")
+async def c_scegli(update, ctx):
+    t = arg_text(update)
+    if not t: raise ValueError("Uso: /scegli pizza, pasta, sushi")
+    opts = [x.strip() for x in re.split(r"[,;\n]", t) if x.strip()]
+    await say(update, f"🎯 Scelgo: {random.choice(opts)}")
+
+@cmd("traduci")
+async def c_traduci(update, ctx):
+    if len(ctx.args) < 2: raise ValueError("Uso: /traduci en ciao come stai")
+    lang = ctx.args[0]; text = " ".join(ctx.args[1:])
+    data = await http_get("https://api.mymemory.translated.net/get", q=text, langpair=f"it|{lang}")
+    tr = data.get("responseData", {}).get("translatedText", "")
+    await say(update, f"🌐 {text}\n➡️ {tr}")
+
+@cmd("wiki")
+async def c_wiki(update, ctx):
+    q = arg_text(update)
+    if not q: raise ValueError("Uso: /wiki Leonardo da Vinci")
+    data = await http_get(f"https://it.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(q)}")
+    if not data.get("extract"): raise LookupError(f"Niente su «{q}» su Wikipedia")
+    await say(update, f"📖 {data.get('title')}\n\n{data['extract'][:1500]}")
+
+@cmd("help")
+async def c_help(update, ctx):
+    await say(update, help_text())
+
+@cmd("id")
+async def c_id(update, ctx):
+    await say(update, f"🆔 Il tuo ID è: {update.effective_user.id}")
+
+@cmd("ping")
+async def c_ping(update, ctx):
+    up = int(time.time() - START)
+    await say(update, f"🏓 Pong! Bot online da {up//60}m {up%60}s ✅")
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("Manca BOT_TOKEN nelle variabili d'ambiente")
+    app = Application.builder().token(TOKEN).build()
+    for name, fn in HANDLERS.items():
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, t_meteo))
+    cmds = []
+    for _, items in GROUPS:
+        for name, usage, desc in items:
+            cmds.append(BotCommand(name, desc))
+    async def set_cmds(app_):
+        try: await app_.bot.set_my_commands(cmds)
+        except Exception: pass
+    app.post_init = set_cmds
+    log.info("Bot avviato, OWNER_ID=%s", OWNER_ID)
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
